@@ -7,7 +7,13 @@ Servidor pequeño que:
   3. Pide a Claude que evalúe la respuesta del usuario.
   4. Transcribe audio a texto (Whisper de OpenAI o Groq).
 
-La app del iPhone nunca ve tus claves de API: solo habla con este servidor.
+La app nunca ve tus claves de API: solo habla con este servidor.
+
+Cuentas de usuario (opcional, con Supabase):
+  - Si defines SUPABASE_URL, cada petición debe venir con la sesión del usuario
+    (Authorization: Bearer <token>) y se aplican límites diarios por usuario.
+  - Mientras PERMITIR_TOKEN_APP=true, también se acepta el APP_TOKEN antiguo
+    (útil durante la transición).
 """
 
 import io
@@ -15,6 +21,7 @@ import json
 import os
 import random
 import re
+import time
 
 import httpx
 from docx import Document
@@ -36,16 +43,101 @@ TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "whisper-1")
 APP_TOKEN = os.getenv("APP_TOKEN", "")
 MAX_CHARS = int(os.getenv("MAX_CHARS", "60000"))
 
+# --- Cuentas de usuario (Supabase)
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+PERMITIR_TOKEN_APP = os.getenv("PERMITIR_TOKEN_APP", "true").lower() == "true"
+ADMIN_EMAILS = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()}
+
+# Límites diarios por usuario (0 = sin límite)
+LIMITES = {
+    "extraer": int(os.getenv("LIMITE_EXTRAER_DIA", "20")),
+    "cuestionario": int(os.getenv("LIMITE_CUESTIONARIOS_DIA", "15")),
+    "evaluar": int(os.getenv("LIMITE_EVALUAR_DIA", "200")),
+    "transcribir": int(os.getenv("LIMITE_TRANSCRIBIR_DIA", "400")),
+}
+NOMBRES_USO = {
+    "extraer": "archivos subidos",
+    "cuestionario": "cuestionarios generados",
+    "evaluar": "respuestas corregidas",
+    "transcribir": "respuestas por voz",
+}
+
 app = FastAPI(title="EstudIA backend")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
 
 
-def verificar_token(x_app_token: str = Header(default="")):
-    """Si definiste APP_TOKEN, solo tu app (que envía ese token) puede usar el servidor."""
-    if APP_TOKEN and x_app_token != APP_TOKEN:
+# ---------------------------------------------------------------- usuarios
+
+_cache_sesiones: dict[str, tuple[float, dict]] = {}
+
+
+def _cabeceras_supabase(clave: str) -> dict:
+    cab = {"apikey": clave}
+    if not clave.startswith("sb_"):  # claves antiguas (JWT) también van como Bearer
+        cab["Authorization"] = f"Bearer {clave}"
+    return cab
+
+
+async def _usuario_desde_token(token: str) -> dict:
+    ahora = time.time()
+    guardado = _cache_sesiones.get(token)
+    if guardado and guardado[0] > ahora:
+        return guardado[1]
+    async with httpx.AsyncClient(timeout=15) as cliente:
+        r = await cliente.get(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {token}"},
+        )
+    if r.status_code != 200:
+        raise HTTPException(401, "Tu sesión expiró. Vuelve a iniciar sesión.")
+    datos = r.json()
+    usuario = {"id": datos["id"], "email": (datos.get("email") or "").lower()}
+    if len(_cache_sesiones) > 2000:
+        _cache_sesiones.clear()
+    _cache_sesiones[token] = (ahora + 300, usuario)
+    return usuario
+
+
+async def verificar_usuario(
+    authorization: str = Header(default=""), x_app_token: str = Header(default="")
+) -> dict:
+    """Devuelve el usuario que hace la petición, o rechaza la petición."""
+    if SUPABASE_URL and authorization.lower().startswith("bearer "):
+        return await _usuario_desde_token(authorization[7:].strip())
+
+    # Modo antiguo / transición: token compartido de la app
+    if not SUPABASE_URL or PERMITIR_TOKEN_APP:
+        if not APP_TOKEN or x_app_token == APP_TOKEN:
+            return {"id": None, "email": ""}
         raise HTTPException(401, "Token inválido")
+
+    raise HTTPException(401, "Debes iniciar sesión.")
+
+
+async def registrar_uso(usuario: dict, tipo: str):
+    """Suma 1 al uso diario del usuario y rechaza si superó su límite."""
+    if not usuario.get("id") or not SUPABASE_SERVICE_KEY:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=15) as cliente:
+            r = await cliente.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/incrementar_uso",
+                headers={**_cabeceras_supabase(SUPABASE_SERVICE_KEY), "Content-Type": "application/json"},
+                json={"p_user": usuario["id"], "p_tipo": tipo},
+            )
+        cantidad = int(r.json()) if r.status_code == 200 else 0
+    except Exception:  # noqa: BLE001  si falla el conteo, no bloqueamos al usuario
+        return
+    limite = LIMITES.get(tipo, 0)
+    if limite and cantidad > limite and usuario.get("email") not in ADMIN_EMAILS:
+        raise HTTPException(
+            429,
+            f"Llegaste al límite diario de {NOMBRES_USO.get(tipo, tipo)} ({limite}). Vuelve a intentarlo mañana.",
+        )
 
 
 # ---------------------------------------------------------------- utilidades
@@ -90,11 +182,18 @@ def extraer_json(texto: str):
 
 @app.get("/")
 def salud():
-    return {"ok": True, "servicio": "EstudIA"}
+    return {"ok": True, "servicio": "EstudIA", "cuentas": bool(SUPABASE_URL)}
 
 
-@app.post("/extraer", dependencies=[Depends(verificar_token)])
-async def extraer(archivo: UploadFile = File(...)):
+@app.get("/yo")
+async def yo(usuario: dict = Depends(verificar_usuario)):
+    """Permite a la app comprobar que la sesión es válida."""
+    return usuario
+
+
+@app.post("/extraer")
+async def extraer(archivo: UploadFile = File(...), usuario: dict = Depends(verificar_usuario)):
+    await registrar_uso(usuario, "extraer")
     datos = await archivo.read()
     nombre = (archivo.filename or "").lower()
     try:
@@ -132,8 +231,9 @@ REGLAS_COMUNES = """- Cubre las ideas más importantes del material, de lo bási
   sin tablas, símbolos raros ni "según la figura"."""
 
 
-@app.post("/cuestionario", dependencies=[Depends(verificar_token)])
-async def cuestionario(p: PedidoCuestionario):
+@app.post("/cuestionario")
+async def cuestionario(p: PedidoCuestionario, usuario: dict = Depends(verificar_usuario)):
+    await registrar_uso(usuario, "cuestionario")
     cantidad = max(3, min(p.cantidad, 30))
     abiertas = p.tipo == "abiertas"
     system = (
@@ -214,8 +314,9 @@ class PedidoEvaluacion(BaseModel):
     respuesta_usuario: str
 
 
-@app.post("/evaluar", dependencies=[Depends(verificar_token)])
-async def evaluar(p: PedidoEvaluacion):
+@app.post("/evaluar")
+async def evaluar(p: PedidoEvaluacion, usuario: dict = Depends(verificar_usuario)):
+    await registrar_uso(usuario, "evaluar")
     system = (
         "Eres un profesor amable que corrige respuestas de estudio. "
         "Respondes únicamente con JSON válido, sin texto adicional."
@@ -242,8 +343,11 @@ en voz alta (sin listas, símbolos ni markdown). Si no es correcta, incluye brev
     return {"resultado": resultado, "comentario": str(data.get("comentario", "")).strip()}
 
 
-@app.post("/transcribir", dependencies=[Depends(verificar_token)])
-async def transcribir(audio: UploadFile = File(...), prompt: str = Form(default="")):
+@app.post("/transcribir")
+async def transcribir(
+    audio: UploadFile = File(...), prompt: str = Form(default=""), usuario: dict = Depends(verificar_usuario)
+):
+    await registrar_uso(usuario, "transcribir")
     if not TRANSCRIBE_API_KEY:
         raise HTTPException(500, "Falta TRANSCRIBE_API_KEY en el servidor")
     datos = await audio.read()
